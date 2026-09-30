@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS reports (
     tested_at            TIMESTAMPTZ NOT NULL,
     released             BOOLEAN     NOT NULL,
     basis_calibration_id BIGINT REFERENCES calibration_versions(id),
+    batch_no             TEXT,                          -- 所属批次号（单份发布为 NULL）
     snapshot             JSONB       NOT NULL,          -- 发布时判定快照（不可变）
     created_at           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
@@ -80,6 +81,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_report_reference
     ON reports (reference) WHERE reference IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_report_instrument_tested
     ON reports (instrument, tested_at);
+
+-- 整批放行：仅“全部可放行并原子发布成功”的批次才落行，故批次号只被成功批次占用；
+-- request_hash 为条目内容（仪器/检测时间/报告编号，按输入顺序）的规范化摘要，
+-- response 为首次发布的完整响应（报告标识/所据校准版本/快照），供同内容重试原样重放。
+CREATE TABLE IF NOT EXISTS report_batches (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_no     TEXT        NOT NULL,
+    request_hash TEXT        NOT NULL,
+    response     JSONB       NOT NULL,          -- 首次成功的完整响应（幂等重放用）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+-- 批次号全局唯一：同号同内容重放、同号异内容拒绝；失败批次不落行、不占用批次号
+CREATE UNIQUE INDEX IF NOT EXISTS uq_report_batches_batch_no
+    ON report_batches (batch_no);
 
 -- 仪器故障禁用区间：独立于校准；撤销仅置 revoked=TRUE，记录永久保留供追溯
 -- created_at 取 clock_timestamp()（语句实际执行时刻，而非事务开始时刻），
@@ -123,6 +139,11 @@ CREATE INDEX IF NOT EXISTS ix_disablement_instrument_active
 -- 幂等迁移：旧库 reports.created_at 默认 now()（事务开始时刻）会令并发跨事务
 -- 时序见证倒置；统一为 clock_timestamp()（实际写入时刻）。新库已为该默认值。
 ALTER TABLE reports ALTER COLUMN created_at SET DEFAULT clock_timestamp();
+
+-- 幂等迁移：reports 增加所属批次号（单份发布为 NULL，批量发布写入批次号供追溯）
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS batch_no TEXT;
+CREATE INDEX IF NOT EXISTS ix_reports_batch_no
+    ON reports (batch_no) WHERE batch_no IS NOT NULL;
 """
 
 

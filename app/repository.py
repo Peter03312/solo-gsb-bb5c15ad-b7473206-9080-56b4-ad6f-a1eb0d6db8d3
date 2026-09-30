@@ -1,6 +1,7 @@
 """领域逻辑：校准判定、版本更正、禁用区间、发布、快照漂移重算。"""
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any
@@ -67,6 +68,25 @@ def prelock_event_then_instrument(event_no: str, instrument: str):
     def _acquire(lock_conn):
         lock_conn.execute("SELECT pg_advisory_lock(%s)", (event_key,))
         lock_conn.execute("SELECT pg_advisory_lock(%s)", (instrument_key,))
+    return _acquire
+
+
+def prelock_batch(batch_no: str, instruments: list[str]):
+    """整批放行的预锁：先批次锁，再按仪器名排序逐台取仪器锁。
+
+    批次锁使同批次号的并发提交（幂等重试）串行；仪器锁与单份发布/校准写/
+    禁用登记共用，保证整批与这些并发写互斥。全局锁序恒为“批次/事件锁 ->
+    仪器锁（名称升序）”，仪器锁永远最后获取，不存在锁环。
+    """
+    batch_key = _lock_key(f"batch\x00{batch_no}")
+    instrument_keys = [
+        _lock_key(f"instrument\x00{name}") for name in sorted(set(instruments))
+    ]
+
+    def _acquire(lock_conn):
+        lock_conn.execute("SELECT pg_advisory_lock(%s)", (batch_key,))
+        for key in instrument_keys:
+            lock_conn.execute("SELECT pg_advisory_lock(%s)", (key,))
     return _acquire
 
 _COVERAGE_SQL = """
@@ -491,6 +511,195 @@ def publish_report(conn, payload) -> dict[str, Any]:
         "reference": report["reference"],
         "snapshot": snapshot,
     }
+
+
+# ---- 整批放行 ------------------------------------------------------------------
+
+def _batch_request_hash(payload) -> str:
+    """批次条目内容的规范化摘要（仪器/检测时间/报告编号，按输入顺序）。
+
+    检测时间已在模型层规范化为 UTC，isoformat 表示稳定；摘要不包含批次号本身
+    （批次号是行的主键语义，摘要仅用于同号内容的异同比较）。
+    """
+    canonical = [
+        {
+            "instrument": item.instrument,
+            "tested_at": item.tested_at.isoformat(),
+            "reference": item.reference,
+        }
+        for item in payload.items
+    ]
+    blob = json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def validate_batch_payload(payload) -> None:
+    """批内形态校验（不持锁、不入库）：报告编号在批内不得重复。"""
+    seen: dict[str, int] = {}
+    for idx, item in enumerate(payload.items, start=1):
+        if item.reference is None:
+            continue
+        first = seen.get(item.reference)
+        if first is not None:
+            raise blocked(
+                "BATCH_DUPLICATE_REFERENCE",
+                f"报告编号在批内重复: {item.reference}（第 {first} 项与第 {idx} 项）",
+                batch_no=payload.batch_no,
+                item_index=idx,
+                first_item_index=first,
+                reference=item.reference,
+            )
+        seen[item.reference] = idx
+
+
+def publish_batch(conn, payload) -> tuple[dict[str, Any], bool]:
+    """整批放行。返回 (响应体, 是否幂等重放)。
+
+    批次锁与全部涉及仪器锁已由调用方经 prelock 在 SERIALIZABLE 事务之外预取，
+    因此本事务快照在取锁后建立：整批各项基于同一可串行状态判定，全部可放行
+    才在同一事务内原子发布；任一项阻断或编号冲突即整体回滚——不产生半批，
+    失败批次不写 report_batches，批次号不被占用。
+    """
+    validate_batch_payload(payload)  # 路由已预检，此处防御（事务内再查一次）
+
+    # 批次号幂等：仅成功批次占用批次号。同内容重试原样返回首次结果（不重判定、
+    # 不重复落库）；同号异内容拒绝。
+    request_hash = _batch_request_hash(payload)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM report_batches WHERE batch_no = %s",
+            (payload.batch_no,),
+        )
+        existing = cur.fetchone()
+    if existing is not None:
+        if existing["request_hash"] == request_hash:
+            return existing["response"], True
+        raise conflict(
+            "BATCH_NO_CONTENT_MISMATCH",
+            f"批次号 {payload.batch_no} 已用于不同内容的批次；"
+            "失败批次不占批次号，若前次未成功请核对条目后重试",
+            batch_no=payload.batch_no,
+        )
+
+    # 逐项判定（同一事务快照 = 同一可串行状态）：禁用优先，沿用单份判定
+    decisions: list[dict[str, Any]] = []
+    for idx, item in enumerate(payload.items, start=1):
+        active = find_active_disablement(conn, item.instrument, item.tested_at,
+                                         lock=True)
+        if active is not None:
+            raise blocked(
+                REASON_INSTRUMENT_DISABLED,
+                f"第 {idx} 项：检测时间 {item.tested_at.isoformat()} 命中仪器 "
+                f"{item.instrument} 未撤销禁用区间（事件 {active['event_no']}）："
+                f"{active['reason']}；整批未放行",
+                batch_no=payload.batch_no,
+                item_index=idx,
+                instrument=item.instrument,
+                tested_at=item.tested_at.isoformat(),
+                basis_disablement=disablement_brief(active),
+            )
+        decision = determine(conn, item.instrument, item.tested_at, lock=True)
+        if not decision["releasable"]:
+            raise blocked(
+                decision["reason_code"],
+                f"第 {idx} 项：{decision['reason_message']}；整批未放行",
+                batch_no=payload.batch_no,
+                item_index=idx,
+                instrument=item.instrument,
+                tested_at=item.tested_at.isoformat(),
+                nearest_calibration=(
+                    _cal_brief(decision["nearest_calibration"])
+                    if decision.get("nearest_calibration") else None
+                ),
+            )
+        decisions.append(decision)
+
+    # 报告编号与已发布记录冲突预检（给出条目位置）；跨仪器并发同号由唯一索引兜底
+    refs = [item.reference for item in payload.items if item.reference is not None]
+    if refs:
+        rows = conn.execute(
+            "SELECT reference FROM reports WHERE reference = ANY(%s)", (refs,),
+        ).fetchall()
+        if rows:
+            taken = {row["reference"] for row in rows}
+            for idx, item in enumerate(payload.items, start=1):
+                if item.reference in taken:
+                    raise conflict(
+                        "REPORT_REFERENCE_EXISTS",
+                        f"第 {idx} 项：报告编号已存在: {item.reference}；整批未放行",
+                        batch_no=payload.batch_no,
+                        item_index=idx,
+                        reference=item.reference,
+                    )
+
+    # 全部可放行：同一事务内原子发布（任一条失败即整批回滚，不产生半批）
+    items_out: list[dict[str, Any]] = []
+    for idx, (item, decision) in enumerate(zip(payload.items, decisions), start=1):
+        basis = decision["calibration"]
+        snapshot: dict[str, Any] = {
+            "released": True,
+            "reason_code": REASON_PASSED,
+            "instrument": item.instrument,
+            "tested_at": item.tested_at.isoformat(),
+            "basis_calibration": _cal_brief(basis),
+        }
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO reports
+                        (reference, instrument, tested_at, released,
+                         basis_calibration_id, snapshot, batch_no)
+                    VALUES (%s, %s, %s, TRUE, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (item.reference, item.instrument, item.tested_at,
+                     basis["id"], json.dumps(snapshot), payload.batch_no),
+                )
+            except UniqueViolation:
+                # 并发他批/单份（不共享本批仪器锁的仪器）同号插入：唯一索引兜底
+                raise conflict(
+                    "REPORT_REFERENCE_EXISTS",
+                    f"第 {idx} 项：报告编号已存在: {item.reference}；整批未放行",
+                    batch_no=payload.batch_no,
+                    item_index=idx,
+                    reference=item.reference,
+                )
+            report = cur.fetchone()
+        items_out.append({
+            "position": idx,
+            "report_id": report["id"],
+            "reference": report["reference"],
+            "instrument": item.instrument,
+            "tested_at": item.tested_at.isoformat(),
+            "basis_calibration": _cal_brief(basis),
+            "snapshot": snapshot,
+        })
+
+    response: dict[str, Any] = {
+        "batch_no": payload.batch_no,
+        "released": True,
+        "reason_code": REASON_PASSED,
+        "count": len(items_out),
+        "items": items_out,
+    }
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO report_batches (batch_no, request_hash, response)
+            VALUES (%s, %s, %s)
+            """,
+            (payload.batch_no, request_hash, json.dumps(response)),
+        )
+    return response, False
+
+
+def get_batch(conn, batch_no: str) -> dict[str, Any] | None:
+    """按批次号查询成功批次的首次发布结果；未知批次返回 None。"""
+    return conn.execute(
+        "SELECT * FROM report_batches WHERE batch_no = %s", (batch_no,),
+    ).fetchone()
 
 
 # ---- 漂移重算 ------------------------------------------------------------------

@@ -79,6 +79,50 @@ def main() -> None:
     status, body = call("GET", "/calibrations?instrument=GC-02", None)
     show("该校准全部版本（旧版保留可查）", status, body)
 
+    # ---- 整批放行：一次委托多份报告，全部可放行才原子发布 ----
+    status, body = call("POST", "/calibrations", {
+        "instrument": "LC-09",
+        "valid_from": "2026-01-01T00:00:00Z",
+        "valid_to": "2027-01-01T00:00:00Z",
+        "passed": True,
+    })
+    batch = {
+        "batch_no": "BATCH-DEMO-1",
+        "items": [
+            {"instrument": "LC-09", "tested_at": "2026-03-15T08:00:00Z",
+             "reference": "LC-REP-1"},
+            {"instrument": "LC-09", "tested_at": "2026-03-16T09:00:00Z",
+             "reference": "LC-REP-2"},
+        ],
+    }
+    status, body = call("POST", "/reports/batches", batch)
+    show("整批放行（应 201，按输入顺序返回报告标识/依据/快照）", status, body)
+
+    status, body = call("POST", "/reports/batches", batch)
+    show("相同内容重试（应 200，幂等重放首次结果）", status, body)
+
+    status, body = call("POST", "/reports/batches", {
+        "batch_no": "BATCH-DEMO-1",
+        "items": [{"instrument": "LC-09", "tested_at": "2026-04-01T08:00:00Z",
+                   "reference": "LC-REP-9"}],
+    })
+    show("同批次号不同内容（应 409 BATCH_NO_CONTENT_MISMATCH）", status, body)
+
+    status, body = call("POST", "/reports/batches", {
+        "batch_no": "BATCH-DEMO-2",
+        "items": [
+            {"instrument": "LC-09", "tested_at": "2026-05-15T08:00:00Z",
+             "reference": "LC-REP-3"},
+            {"instrument": "LC-09", "tested_at": "2030-01-01T08:00:00Z",
+             "reference": "LC-REP-4"},
+        ],
+    })
+    show("第 2 项区间外被阻断（应 422 含 item_index，整批不落库、批次号可复用）",
+         status, body)
+
+    status, body = call("GET", "/reports/batches/BATCH-DEMO-1", None)
+    show("按批次号查询首次发布结果", status, body)
+
 
 if __name__ == "__main__":
     main()

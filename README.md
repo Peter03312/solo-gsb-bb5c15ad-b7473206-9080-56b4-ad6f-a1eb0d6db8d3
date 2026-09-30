@@ -1,7 +1,7 @@
 # 实验室检测报告放行服务
 
 基于 **Python + FastAPI + PostgreSQL** 的 HTTP API：管理仪器校准记录（含有效期、通过/未通过结论、更正版本链）、
-仪器**故障禁用区间**（登记/撤销/追溯），并据此对检测报告做放行判定。
+仪器**故障禁用区间**（登记/撤销/追溯），并据此对检测报告做放行判定（单份或**带批次号的整批放行**）。
 
 ## 核心规则
 
@@ -35,12 +35,28 @@
 - 已发布报告的快照**永不改写**；禁用**登记/撤销后受影响查询结果随之变化**，但原放行记录与快照保持原值。
   追溯登记一个覆盖过去的禁用区间，不会撤销此前已放行的报告，只会使其出现在“受影响报告”查询中。
 
+### 整批放行（本轮新增）
+
+- 一次委托多份报告可经 `POST /reports/batches` 整批放行：请求含**唯一批次号**与**非空有序条目**
+  （每项：仪器、检测时间、可选报告编号，结构同单份提交）。
+- 每项沿用单份判定（**禁用优先、当前校准版本、左闭右开区间**），整批基于**同一可串行状态**
+  （同一 SERIALIZABLE 快照 + 批次锁/全部涉及仪器锁）判定，**全部可放行才在同一事务内原子发布**；
+  响应按**输入顺序**返回各项的报告标识（`report_id`/`reference`）、所据校准版本与发布快照。
+- **任一项被阻断**（禁用/无校准/区间外/未通过）或**报告编号冲突**时：返回 `item_index`
+  （条目位置，1 起）与原因码，**整批不产生任何报告，且失败不占用批次号**（修正后可同号重发）。
+  批内编号重复：`422 BATCH_DUPLICATE_REFERENCE`；与已发布记录冲突：`409 REPORT_REFERENCE_EXISTS`。
+- **成功批次以批次号幂等**：相同内容重试返回首次结果（`200` 重放，不重复判定、不重复落库）；
+  同号**不同内容**拒绝（`409 BATCH_NO_CONTENT_MISMATCH`）。内容按条目（仪器/检测时间/编号，
+  输入顺序）规范化摘要比较，同时刻的不同时区写法视为相同。
+- 并发校准更正、禁用登记/撤销、同批次重试与多批并发均不会产生半批或使用过期状态；
+  已发布批次结果可按 `GET /reports/batches/{batch_no}` 查询。
+
 ### 并发与隔离
 
 - 所有写事务运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试；
-  校准写、禁用登记/撤销、报告提交在开启事务**之前**先获取**每仪器/每事件会话级咨询锁**
-  （64 位 FNV-1a 哈希为键），再拍 SERIALIZABLE 快照——保证判定读取的是“取锁后”的稳定状态，
-  **不会在已生效禁用区间内误放行**，并发区间登记也至多一条成功。
+  校准写、禁用登记/撤销、报告提交（单份与整批）在开启事务**之前**先获取
+  **每仪器/每事件/每批次会话级咨询锁**（64 位 FNV-1a 哈希为键），再拍 SERIALIZABLE 快照——
+  保证判定读取的是“取锁后”的稳定状态，**不会在已生效禁用区间内误放行**，并发区间登记也至多一条成功。
 - 唯一/部分唯一索引与 GiST 排他约束在数据库层兜底，杜绝“双最新版”、“重叠禁用区间”等脏数据。
 
 ## 一键启动
@@ -116,6 +132,8 @@ uvicorn app.main:app --reload
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/reports` | 提交报告并判定放行（命中禁用优先阻断） |
+| POST | `/reports/batches` | 整批放行（唯一批次号，全部可放行才原子发布，幂等重放） |
+| GET | `/reports/batches/{batch_no}` | 查询成功批次的首次发布结果 |
 | GET | `/reports?instrument=` | 已发布报告列表（含不可变快照） |
 | GET | `/reports/{id}` | 单条报告 |
 | GET | `/reports/drift/recompute` | 同上，重算漂移 |
@@ -272,6 +290,51 @@ curl 'http://localhost:8000/disablements/affected-reports?instrument=HPLC-01'
 全部禁用记录（含已撤销）可经 `GET /disablements?instrument=HPLC-01` 追溯；
 `active_only=true` 仅看未撤销区间。
 
+### 2d. 整批放行（多仪器一次委托）
+
+```bash
+curl -sS -X POST http://localhost:8000/reports/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_no": "BATCH-2026-0001",
+        "items": [
+          {"instrument": "HPLC-01", "tested_at": "2026-03-15T08:00:00Z", "reference": "R-2026-0101"},
+          {"instrument": "GC-02",   "tested_at": "2026-03-16T09:00:00Z", "reference": "R-2026-0102"}
+        ]
+      }'
+```
+
+首次成功返回（`201`；按输入顺序给出各项报告标识、所据校准版本与发布快照）：
+
+```json
+{
+  "batch_no": "BATCH-2026-0001",
+  "released": true,
+  "reason_code": "PASSED_CALIBRATION_COVERAGE",
+  "count": 2,
+  "items": [
+    {"position": 1, "report_id": 7, "reference": "R-2026-0101",
+     "instrument": "HPLC-01", "tested_at": "2026-03-15T08:00:00+00:00",
+     "basis_calibration": {"id": 1, "chain_id": 1, "version": 1, "passed": true, "...": "..."},
+     "snapshot": {"released": true, "reason_code": "PASSED_CALIBRATION_COVERAGE", "...": "..."}},
+    {"position": 2, "report_id": 8, "reference": "R-2026-0102", "...": "..."}
+  ]
+}
+```
+
+幂等与拒绝：
+
+- **相同内容重试** → `200`，响应体与首次完全一致（`report_id` 相同，不重复落库）；
+- **同批次号不同内容** → `409 BATCH_NO_CONTENT_MISMATCH`；
+- **任一项阻断** → `422`，`detail.item_index` 指出条目位置，原因码同单份
+  （如 `INSTRUMENT_DISABLED` 并附 `basis_disablement`），整批不落库、**批次号不被占用**，
+  修正条目后可同号重发；
+- **批内编号重复** → `422 BATCH_DUPLICATE_REFERENCE`（含 `item_index`/`first_item_index`）；
+- **与已发布编号冲突** → `409 REPORT_REFERENCE_EXISTS`（含 `item_index`）。
+
+已发布批次可随时查询：`curl http://localhost:8000/reports/batches/BATCH-2026-0001`
+（未知批次 `404`）。
+
 ### 3. 更正校准（连续版本号 + 引用原记录）
 
 ```bash
@@ -309,6 +372,7 @@ curl -sS 'http://localhost:8000/calibrations/drift/recompute?instrument=HPLC-01'
 ```bash
 bash examples/curl-demo.sh                       # 校准/报告/更正/漂移全流程
 bash examples/curl-disablements.sh               # 禁用登记/阻断依据/撤销/追溯/受影响报告
+bash examples/curl-batches.sh                    # 整批放行/幂等重放/阻断回滚/失败不占批次号
 BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正的 Python 版
 ```
 
@@ -319,6 +383,8 @@ DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
   PYTHONPATH=. python3 tests/verify_concurrency.py    # 校准版本链与发布并发
 DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
   PYTHONPATH=. python3 tests/verify_disablements.py   # 禁用登记/撤销/发布并发与边界
+DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
+  PYTHONPATH=. python3 tests/verify_batches.py        # 整批放行/幂等/并发无半批
 ```
 
 ## 并发正确性如何保证
@@ -345,3 +411,13 @@ DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
 5. **快照与受影响查询解耦**：报告发布时的判定快照写入 `reports.snapshot` 后永不更新；
    `/disablements/affected-reports` 用当前未撤销禁用区间与已发布报告实时 JOIN，
    登记/撤销后结果立即变化，且每份报告至多命中一条禁用依据（未撤销区间不重叠）。
+6. **整批原子与幂等**
+   - 批量提交在事务外先取**批次锁**（`batch\x00<batch_no>`）再按仪器名升序取**全部涉及
+     仪器锁**（全局锁序恒为“批次/事件锁 -> 仪器锁”，无锁环），随后在同一 SERIALIZABLE
+     事务内完成“逐项判定 -> 全部插入 -> 登记批次行”：任一项阻断或编号冲突即整体回滚，
+     **不产生半批**；`report_batches` 仅在成功时落行，故**失败不占批次号**。
+   - 批次号上有唯一索引 `uq_report_batches_batch_no`；同号并发经批次锁串行，
+     内容摘要（SHA-256，仪器/检测时间/编号按输入顺序）相同则**原样重放首次响应**，
+     不同则 `409`；重放不重新判定，因此更正/撤销生效后重试仍返回首次结果。
+   - 批量与并发更正/禁用登记经共享仪器锁互斥；与撤销之间由 SERIALIZABLE 谓词依赖
+     保证可串行（同单份发布机制），重试耗尽返回 `409 TRANSACTION_CONFLICT`。

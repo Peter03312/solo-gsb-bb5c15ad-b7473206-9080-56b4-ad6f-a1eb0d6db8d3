@@ -43,6 +43,14 @@ class ReportSubmit(BaseModel):
     _normalize_tested = field_validator("tested_at")(lambda cls, v: as_utc(v))
 
 
+class ReportBatchSubmit(BaseModel):
+    """整批放行请求：唯一批次号 + 非空有序报告条目（条目结构同单份提交）。"""
+    batch_no: str = Field(..., min_length=1,
+                          description="唯一批次号；成功批次以其幂等（同内容重放，异内容拒绝）")
+    items: list[ReportSubmit] = Field(..., min_length=1,
+                                      description="非空有序报告条目，按输入顺序判定与返回")
+
+
 class DisablementCreate(BaseModel):
     event_no: str = Field(..., min_length=1, description="唯一禁用事件号（撤销凭据，不可复用）")
     instrument: str = Field(..., min_length=1, description="仪器标识")
