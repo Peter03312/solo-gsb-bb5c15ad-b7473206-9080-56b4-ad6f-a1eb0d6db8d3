@@ -5,9 +5,15 @@ from fastapi import APIRouter
 
 from .. import db
 from ..errors import not_found
-from ..models import ReportSubmit
+from ..models import BatchReportSubmit, ReportSubmit
 from ..repository import compute_drift
-from ..repository import prelock_instrument, publish_report
+from ..repository import (
+    prelock_batch,
+    prelock_instrument,
+    publish_batch,
+    publish_report,
+    validate_batch_payload,
+)
 from ..transactions import run_tx
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -21,6 +27,7 @@ def _serialize_report(row: dict) -> dict:
         "tested_at": row["tested_at"].isoformat(),
         "released": row["released"],
         "basis_calibration_id": row["basis_calibration_id"],
+        "batch_no": row["batch_no"],
         "snapshot": row["snapshot"],
         "created_at": row["created_at"].isoformat(),
     }
@@ -40,6 +47,29 @@ def submit_report(payload: ReportSubmit):
     return run_tx(
         lambda conn: publish_report(conn, payload),
         prelock=prelock_instrument(payload.instrument),
+    )
+
+
+@router.post("/batches", status_code=201)
+def submit_batch(payload: BatchReportSubmit):
+    """整批放行：一次委托的多份报告按唯一批次号原子发布。
+
+    每个条目沿用单份提交的判定（禁用优先、当前校准版本、左闭右开区间与
+    阻断原因），全部条目可放行才在同一事务内发布；按输入顺序返回各报告的
+    标识、所据校准版本与发布快照。
+
+    - 任一条目被阻断：422，detail 含 entry_index 与该条目的阻断原因，整批不落库
+    - 批内报告编号重复：422 BATCH_DUPLICATE_REFERENCE（取锁前拒绝）
+    - 编号与已发布报告冲突：409 REPORT_REFERENCE_EXISTS，detail 含 entry_index
+    - 失败整体回滚，不占批次号；成功批次以批次号幂等：相同内容重试返回首次
+      结果（201 与原响应），相同批次号不同内容返回 409 BATCH_CONTENT_MISMATCH
+    """
+    # 批内编号冲突属请求自身矛盾，取锁/开事务前即拒绝
+    validate_batch_payload(payload)
+    return run_tx(
+        lambda conn: publish_batch(conn, payload),
+        prelock=prelock_batch(payload.batch_no,
+                              [e.instrument for e in payload.entries]),
     )
 
 

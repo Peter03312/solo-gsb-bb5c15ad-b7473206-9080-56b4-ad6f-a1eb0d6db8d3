@@ -43,6 +43,27 @@ class ReportSubmit(BaseModel):
     _normalize_tested = field_validator("tested_at")(lambda cls, v: as_utc(v))
 
 
+class BatchReportEntry(BaseModel):
+    """整批放行中的单份报告条目（按输入顺序判定与发布）。"""
+    instrument: str = Field(..., min_length=1)
+    tested_at: datetime = Field(..., description="检测时间，据此判断校准是否覆盖")
+    reference: str | None = Field(None, description="可选业务报告编号；提供则需全局唯一")
+
+    _normalize_tested = field_validator("tested_at")(lambda cls, v: as_utc(v))
+
+
+class BatchReportSubmit(BaseModel):
+    """整批放行请求：唯一批次号 + 非空有序条目。
+
+    全部条目可放行才原子发布；成功批次以批次号幂等（相同内容重试返回首次
+    结果，不同内容拒绝）；失败整体回滚，不占批次号。
+    """
+    batch_no: str = Field(..., min_length=1,
+                          description="唯一批次号（成功批次的幂等键）")
+    entries: list[BatchReportEntry] = Field(..., min_length=1,
+                                            description="非空有序报告条目")
+
+
 class DisablementCreate(BaseModel):
     event_no: str = Field(..., min_length=1, description="唯一禁用事件号（撤销凭据，不可复用）")
     instrument: str = Field(..., min_length=1, description="仪器标识")

@@ -79,6 +79,45 @@ def main() -> None:
     status, body = call("GET", "/calibrations?instrument=GC-02", None)
     show("该校准全部版本（旧版保留可查）", status, body)
 
+    # ---- 整批放行：一次委托多台仪器多份报告，唯一批次号原子发布 ----
+    call("POST", "/calibrations", {
+        "instrument": "LC-03",
+        "valid_from": "2026-01-01T00:00:00Z",
+        "valid_to": "2027-01-01T00:00:00Z",
+        "passed": True,
+    })
+    batch = {
+        "batch_no": "BATCH-DEMO-1",
+        "entries": [
+            {"instrument": "GC-02", "tested_at": "2026-03-20T08:00:00Z",
+             "reference": "B-REP-1"},
+            {"instrument": "LC-03", "tested_at": "2026-03-20T09:00:00Z",
+             "reference": "B-REP-2"},
+        ],
+    }
+    status, body = call("POST", "/reports/batches", batch)
+    show("整批放行（两台仪器两份报告，应 201）", status, body)
+
+    status, replay = call("POST", "/reports/batches", batch)
+    print(f"\n== 相同内容重试 -> HTTP {status}，与首次完全一致: {replay == body} ==")
+
+    status, body = call("POST", "/reports/batches", {
+        "batch_no": "BATCH-DEMO-1",  # 同号但内容不同
+        "entries": [{"instrument": "LC-03", "tested_at": "2026-03-21T09:00:00Z"}],
+    })
+    show("同批次号不同内容（应 409 BATCH_CONTENT_MISMATCH）", status, body)
+
+    status, body = call("POST", "/reports/batches", {
+        "batch_no": "BATCH-DEMO-2",
+        "entries": [
+            {"instrument": "LC-03", "tested_at": "2026-03-22T09:00:00Z",
+             "reference": "B-REP-3"},
+            {"instrument": "LC-03", "tested_at": "2030-01-01T09:00:00Z",
+             "reference": "B-REP-4"},  # 区间外：整批回滚
+        ],
+    })
+    show("任一条目阻断（应 422，detail 含 entry_index，整批不落库）", status, body)
+
 
 if __name__ == "__main__":
     main()

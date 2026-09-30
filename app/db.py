@@ -81,6 +81,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_report_reference
 CREATE INDEX IF NOT EXISTS ix_report_instrument_tested
     ON reports (instrument, tested_at);
 
+-- 整批放行批次：仅“成功发布”的批次落行（失败整体回滚，不占批次号）。
+-- request_hash 为规范化请求内容哈希：同批次号重试时比对——相同内容原样
+-- 重放 response（首次结果），不同内容拒绝（409）。
+CREATE TABLE IF NOT EXISTS report_batches (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_no     TEXT        NOT NULL,                 -- 唯一批次号（幂等键）
+    request_hash TEXT        NOT NULL,                 -- 规范化请求内容 SHA-256
+    response     JSONB       NOT NULL,                   -- 首次成功响应（幂等重放依据）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_report_batch_no
+    ON report_batches (batch_no);
+
+-- 报告与批次的关联（单份提交为 NULL）；幂等迁移，列/约束不存在时才添加
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS batch_no TEXT;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_report_batch'
+    ) THEN
+        ALTER TABLE reports
+            ADD CONSTRAINT fk_report_batch
+            FOREIGN KEY (batch_no) REFERENCES report_batches (batch_no);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS ix_report_batch_no ON reports (batch_no);
+
 -- 仪器故障禁用区间：独立于校准；撤销仅置 revoked=TRUE，记录永久保留供追溯
 -- created_at 取 clock_timestamp()（语句实际执行时刻，而非事务开始时刻），
 -- 以便跨事务按“取锁后真正写入”的墙钟顺序见证串行化。

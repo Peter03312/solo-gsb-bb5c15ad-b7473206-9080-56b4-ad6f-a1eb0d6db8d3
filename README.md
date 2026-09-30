@@ -35,6 +35,24 @@
 - 已发布报告的快照**永不改写**；禁用**登记/撤销后受影响查询结果随之变化**，但原放行记录与快照保持原值。
   追溯登记一个覆盖过去的禁用区间，不会撤销此前已放行的报告，只会使其出现在“受影响报告”查询中。
 
+### 整批放行（本轮新增）
+
+- 一次检测委托的多份报告可经 `POST /reports/batches` 按**唯一批次号**整批放行：
+  请求含**非空有序**条目，每项给仪器、检测时间和可选报告编号。
+- 每个条目**沿用单份提交的全部判定**（禁用优先、当前校准版本、左闭右开区间、阻断原因）；
+  整批在**同一可串行快照**上判定，**全部可放行才在同一事务内原子发布**，
+  按输入顺序返回各报告的标识、所据校准版本与发布快照。
+- 任一失败整批回滚、**不产生任何报告**且**不占批次号**（同号修正后可重提）：
+  - 任一条目被阻断 → `422`，`detail` 含 `entry_index` 与该条目的阻断原因/依据；
+  - 批内报告编号重复 → `422 BATCH_DUPLICATE_REFERENCE`（含两个条目位置，取锁前拒绝）；
+  - 编号与已发布报告冲突 → `409 REPORT_REFERENCE_EXISTS`（含 `entry_index`）。
+- 成功批次以批次号**幂等**：相同内容重试返回**首次结果**（`201` 与原响应，不新增报告）；
+  同批次号不同内容拒绝（`409 BATCH_CONTENT_MISMATCH`）。
+- 批次请求在事务外先取**批次锁 + 全部涉及仪器锁**（仪器锁按字典序，全局锁序与既有
+  “事件锁→仪器锁”一致，无锁环），再拍 SERIALIZABLE 快照：并发校准更正、禁用登记/撤销、
+  单份发布及同批次重试都**不会产生半批或使用过期状态**。
+- 报告行记录 `batch_no`（单份提交为 `null`），列表/单条查询可追溯所属批次。
+
 ### 并发与隔离
 
 - 所有写事务运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试；
@@ -116,7 +134,8 @@ uvicorn app.main:app --reload
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/reports` | 提交报告并判定放行（命中禁用优先阻断） |
-| GET | `/reports?instrument=` | 已发布报告列表（含不可变快照） |
+| POST | `/reports/batches` | 整批放行：唯一批次号 + 有序条目，同快照判定、原子发布、按批次号幂等 |
+| GET | `/reports?instrument=` | 已发布报告列表（含不可变快照与所属批次号） |
 | GET | `/reports/{id}` | 单条报告 |
 | GET | `/reports/drift/recompute` | 同上，重算漂移 |
 
@@ -272,6 +291,47 @@ curl 'http://localhost:8000/disablements/affected-reports?instrument=HPLC-01'
 全部禁用记录（含已撤销）可经 `GET /disablements?instrument=HPLC-01` 追溯；
 `active_only=true` 仅看未撤销区间。
 
+### 2d. 整批放行（唯一批次号，原子发布）
+
+```bash
+curl -sS -X POST http://localhost:8000/reports/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_no": "BATCH-2026-0930-01",
+        "entries": [
+          {"instrument": "HPLC-01", "tested_at": "2026-03-15T08:00:00Z", "reference": "R-2026-0001"},
+          {"instrument": "GC-02",   "tested_at": "2026-03-15T09:30:00Z", "reference": "R-2026-0002"},
+          {"instrument": "HPLC-01", "tested_at": "2026-03-16T08:00:00Z"}
+        ]
+      }'
+```
+
+返回（`201`，按输入顺序给出各报告的标识、所据校准版本与发布快照）：
+
+```json
+{
+  "batch_no": "BATCH-2026-0930-01",
+  "released": true,
+  "count": 3,
+  "reports": [
+    {"entry_index": 0, "report_id": 1, "reference": "R-2026-0001",
+     "instrument": "HPLC-01", "tested_at": "2026-03-15T08:00:00+00:00",
+     "reason_code": "PASSED_CALIBRATION_COVERAGE",
+     "basis_calibration": {"id": 1, "chain_id": 1, "version": 1, "...": "..."},
+     "snapshot": {"released": true, "...": "..."}}
+  ]
+}
+```
+
+- **幂等**：相同内容重试返回 `201` 与首次完全一致的响应（相同 `report_id`，不新增报告）；
+  同批次号不同内容返回 `409 BATCH_CONTENT_MISMATCH`。
+- **整批回滚**：任一条目被阻断（如条目 1 命中禁用）返回 `422`，
+  `detail` 含 `entry_index`、`basis_disablement` 等该条目的阻断依据，**整批不落库、批次号不被占用**，
+  修正后可用同一批次号重提；
+  批内编号重复 `422 BATCH_DUPLICATE_REFERENCE`（`entry_indices` 给出两个位置）；
+  编号与已发布报告冲突 `409 REPORT_REFERENCE_EXISTS`（`entry_index` 给出位置）。
+- 完整演示见 `examples/curl-batches.sh`。
+
 ### 3. 更正校准（连续版本号 + 引用原记录）
 
 ```bash
@@ -309,7 +369,8 @@ curl -sS 'http://localhost:8000/calibrations/drift/recompute?instrument=HPLC-01'
 ```bash
 bash examples/curl-demo.sh                       # 校准/报告/更正/漂移全流程
 bash examples/curl-disablements.sh               # 禁用登记/阻断依据/撤销/追溯/受影响报告
-BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正的 Python 版
+bash examples/curl-batches.sh                    # 整批放行/幂等重试/阻断回滚/编号冲突
+BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与整批放行的 Python 版
 ```
 
 ### 并发正确性自检脚本（直连数据库）
@@ -319,6 +380,8 @@ DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
   PYTHONPATH=. python3 tests/verify_concurrency.py    # 校准版本链与发布并发
 DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
   PYTHONPATH=. python3 tests/verify_disablements.py   # 禁用登记/撤销/发布并发与边界
+DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
+  PYTHONPATH=. python3 tests/verify_batches.py        # 整批放行幂等/原子性/并发互斥
 ```
 
 ## 并发正确性如何保证
@@ -345,3 +408,14 @@ DATABASE_URL=postgresql://lab:lab@localhost:5432/lab \
 5. **快照与受影响查询解耦**：报告发布时的判定快照写入 `reports.snapshot` 后永不更新；
    `/disablements/affected-reports` 用当前未撤销禁用区间与已发布报告实时 JOIN，
    登记/撤销后结果立即变化，且每份报告至多命中一条禁用依据（未撤销区间不重叠）。
+6. **整批放行原子且幂等**
+   - 批次请求在事务外先取**批次锁**（`batch\x00<batch_no>`）再按字典序取**全部涉及仪器锁**，
+     全局锁序“命名锁（event/batch，至多一把）→ 仪器锁（升序）”无锁环；
+     同批次号并发重试在批次锁上串行，后到者读到首次已提交结果：内容相同原样重放，
+     不同则 `409 BATCH_CONTENT_MISMATCH`。
+   - 判定与发布在**同一 SERIALIZABLE 事务**内完成：任一失败整体回滚，**不产生半批**，
+     批次行一并回滚故**失败不占批次号**；仪器锁保证并发更正/禁用登记/单份发布
+     不会插入批批判定中间，撤销经 SERIALIZABLE 谓词依赖 + 行锁保证可串行。
+   - `report_batches.batch_no` 唯一索引兜底幂等键；`reports.reference` 唯一索引兜底
+     跨仪器/跨批次的编号冲突（冲突方整批回滚并返回 `409 REPORT_REFERENCE_EXISTS`
+     及条目位置）。

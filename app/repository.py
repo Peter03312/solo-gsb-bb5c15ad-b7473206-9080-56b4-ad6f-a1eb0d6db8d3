@@ -1,6 +1,7 @@
-"""领域逻辑：校准判定、版本更正、禁用区间、发布、快照漂移重算。"""
+"""领域逻辑：校准判定、版本更正、禁用区间、发布（单份/整批）、快照漂移重算。"""
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any
@@ -67,6 +68,27 @@ def prelock_event_then_instrument(event_no: str, instrument: str):
     def _acquire(lock_conn):
         lock_conn.execute("SELECT pg_advisory_lock(%s)", (event_key,))
         lock_conn.execute("SELECT pg_advisory_lock(%s)", (instrument_key,))
+    return _acquire
+
+
+def prelock_batch(batch_no: str, instruments: list[str]):
+    """整批放行的预锁：先批次锁，再按字典序逐个取全部涉及仪器锁。
+
+    全局锁序统一为“命名锁（event/batch，至多一把）-> 仪器锁（升序）”，
+    任何请求都不会持仪器锁等命名锁，故无锁环：
+    - 批次锁使同批次号的并发重试串行——先到者提交后，重试者读到首次结果；
+    - 仪器锁与单份发布/校准写/禁用登记互斥，整批判定在取锁后的快照上进行，
+      不会读到半生效的并发更正/禁用，也不会被并发单份发布插队。
+    """
+    batch_key = _lock_key(f"batch\x00{batch_no}")
+    instrument_keys = [
+        _lock_key(f"instrument\x00{name}") for name in sorted(set(instruments))
+    ]
+
+    def _acquire(lock_conn):
+        lock_conn.execute("SELECT pg_advisory_lock(%s)", (batch_key,))
+        for key in instrument_keys:
+            lock_conn.execute("SELECT pg_advisory_lock(%s)", (key,))
     return _acquire
 
 _COVERAGE_SQL = """
@@ -425,30 +447,41 @@ def correct_calibration(conn, payload) -> tuple[dict[str, Any], list[dict[str, A
 
 # ---- 报告发布 ------------------------------------------------------------------
 
-def publish_report(conn, payload) -> dict[str, Any]:
-    # 仪器咨询锁已由调用方经 prelock 在 SERIALIZABLE 事务之外预取，
-    # 因此本事务快照在取锁之后建立，读取的禁用区间/校准即稳定的判定依据。
+def _release_one(conn, instrument: str, tested_at: datetime,
+                 reference: str | None, *, batch_no: str | None = None,
+                 entry_index: int | None = None) -> dict[str, Any]:
+    """单份报告的“禁用优先 -> 校准判定 -> 落库”核心，单份提交与整批放行共用。
+
+    仪器咨询锁已由调用方经 prelock 在 SERIALIZABLE 事务之外预取，
+    因此本事务快照在取锁之后建立，读取的禁用区间/校准即稳定的判定依据。
+    ``batch_no``/``entry_index`` 仅整批放行时提供：前者写入报告行供追溯，
+    后者附进错误 detail 以定位批内条目；单份提交的错误结构保持原样。
+    """
+    extra: dict[str, Any] = {"instrument": instrument,
+                             "tested_at": tested_at.isoformat()}
+    if batch_no is not None:
+        extra["batch_no"] = batch_no
+    if entry_index is not None:
+        extra["entry_index"] = entry_index
 
     # 禁用优先：检测时间命中未撤销禁用区间则拒绝放行，即使当前校准通过
-    active = find_active_disablement(conn, payload.instrument, payload.tested_at,
-                                     lock=True)
+    active = find_active_disablement(conn, instrument, tested_at, lock=True)
     if active is not None:
         raise blocked(
             REASON_INSTRUMENT_DISABLED,
-            f"检测时间 {payload.tested_at.isoformat()} 命中仪器 {payload.instrument} "
+            f"检测时间 {tested_at.isoformat()} 命中仪器 {instrument} "
             f"未撤销禁用区间（事件 {active['event_no']}）：{active['reason']}",
-            instrument=payload.instrument,
-            tested_at=payload.tested_at.isoformat(),
             basis_disablement=disablement_brief(active),
+            **extra,
         )
 
-    decision = determine(conn, payload.instrument, payload.tested_at, lock=True)
+    decision = determine(conn, instrument, tested_at, lock=True)
     basis = decision["calibration"]
     snapshot: dict[str, Any] = {
         "released": decision["releasable"],
         "reason_code": decision["reason_code"],
-        "instrument": payload.instrument,
-        "tested_at": payload.tested_at.isoformat(),
+        "instrument": instrument,
+        "tested_at": tested_at.isoformat(),
     }
     if basis is not None:
         snapshot["basis_calibration"] = _cal_brief(basis)
@@ -457,12 +490,11 @@ def publish_report(conn, payload) -> dict[str, Any]:
         raise blocked(
             decision["reason_code"],
             decision["reason_message"],
-            instrument=payload.instrument,
-            tested_at=payload.tested_at.isoformat(),
             nearest_calibration=(
                 _cal_brief(decision["nearest_calibration"])
                 if decision.get("nearest_calibration") else None
             ),
+            **extra,
         )
 
     with conn.cursor() as cur:
@@ -471,16 +503,18 @@ def publish_report(conn, payload) -> dict[str, Any]:
                 """
                 INSERT INTO reports
                     (reference, instrument, tested_at, released,
-                     basis_calibration_id, snapshot)
-                VALUES (%s, %s, %s, TRUE, %s, %s)
+                     basis_calibration_id, snapshot, batch_no)
+                VALUES (%s, %s, %s, TRUE, %s, %s, %s)
                 RETURNING *
                 """,
-                (payload.reference, payload.instrument, payload.tested_at,
-                 basis["id"], json.dumps(snapshot)),
+                (reference, instrument, tested_at,
+                 basis["id"], json.dumps(snapshot), batch_no),
             )
         except UniqueViolation:
+            # 单份提交保持原错误结构（无附加字段）；整批附加条目位置等信息
             raise conflict("REPORT_REFERENCE_EXISTS",
-                           f"报告编号已存在: {payload.reference}")
+                           f"报告编号已存在: {reference}",
+                           **(extra if batch_no is not None else {}))
         report = cur.fetchone()
 
     return {
@@ -491,6 +525,122 @@ def publish_report(conn, payload) -> dict[str, Any]:
         "reference": report["reference"],
         "snapshot": snapshot,
     }
+
+
+def publish_report(conn, payload) -> dict[str, Any]:
+    return _release_one(conn, payload.instrument, payload.tested_at,
+                        payload.reference)
+
+
+# ---- 整批放行 ------------------------------------------------------------------
+
+def validate_batch_payload(payload) -> None:
+    """批内报告编号冲突预检（不持锁、不入库），取事务/咨询锁之前拒绝。"""
+    seen: dict[str, int] = {}
+    for index, entry in enumerate(payload.entries):
+        if entry.reference is None:
+            continue
+        first = seen.get(entry.reference)
+        if first is not None:
+            raise blocked(
+                "BATCH_DUPLICATE_REFERENCE",
+                f"批内报告编号重复: {entry.reference}（条目 {first} 与条目 {index}）",
+                batch_no=payload.batch_no,
+                reference=entry.reference,
+                entry_indices=[first, index],
+            )
+        seen[entry.reference] = index
+
+
+def batch_request_hash(payload) -> str:
+    """规范化请求内容哈希：批次号 + 有序条目（仪器 / UTC 检测时间 / 编号）。
+
+    检测时间已经模型层归一化为 UTC，序列化结果稳定：相同内容必得相同哈希，
+    用于成功批次的幂等判定（同号同内容重放，同号不同内容拒绝）。
+    """
+    canonical = {
+        "batch_no": payload.batch_no,
+        "entries": [
+            {
+                "instrument": entry.instrument,
+                "tested_at": entry.tested_at.isoformat(),
+                "reference": entry.reference,
+            }
+            for entry in payload.entries
+        ],
+    }
+    blob = json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def publish_batch(conn, payload) -> dict[str, Any]:
+    """整批放行：同一可串行快照下按输入顺序逐条判定，全部可放行才原子发布。
+
+    批次锁 + 全部涉及仪器锁由调用方经 prelock 在事务外预取，判定读取的是
+    取锁后的稳定状态；并发校准更正/禁用登记/撤销/单份发布经仪器锁或
+    SERIALIZABLE 谓词依赖与本品互斥或可串行，不会产生半批或过期判定。
+
+    - 幂等：批次号已成功且内容相同 -> 原样返回首次响应；内容不同 -> 409；
+    - 任一条目阻断/编号冲突 -> 抛错整体回滚（批次行一并回滚），不占批次号。
+    """
+    request_hash = batch_request_hash(payload)
+
+    # 批次锁已使同批次号请求串行：此处要么查无此批，要么读到已提交的首次结果
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM report_batches WHERE batch_no = %s",
+            (payload.batch_no,),
+        )
+        existing = cur.fetchone()
+    if existing is not None:
+        if existing["request_hash"] == request_hash:
+            return existing["response"]  # 相同内容重试：原样重放首次结果
+        raise conflict(
+            "BATCH_CONTENT_MISMATCH",
+            f"批次号 {payload.batch_no} 已成功放行，本次请求内容与首次不一致，拒绝",
+            batch_no=payload.batch_no,
+        )
+
+    # 批内编号冲突防御性复查（路由已在取锁前预检）
+    validate_batch_payload(payload)
+
+    # 先占批次行（响应在报告落库后回填）：任一后续失败整体回滚，批次号不被占用
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO report_batches (batch_no, request_hash, response) "
+            "VALUES (%s, %s, '{}')",
+            (payload.batch_no, request_hash),
+        )
+
+    released: list[dict[str, Any]] = []
+    for index, entry in enumerate(payload.entries):
+        result = _release_one(conn, entry.instrument, entry.tested_at,
+                              entry.reference,
+                              batch_no=payload.batch_no, entry_index=index)
+        released.append({
+            "entry_index": index,
+            "report_id": result["report_id"],
+            "reference": result["reference"],
+            "instrument": entry.instrument,
+            "tested_at": entry.tested_at.isoformat(),
+            "reason_code": result["reason_code"],
+            "basis_calibration": result["basis_calibration"],
+            "snapshot": result["snapshot"],
+        })
+
+    response = {
+        "batch_no": payload.batch_no,
+        "released": True,
+        "count": len(released),
+        "reports": released,
+    }
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE report_batches SET response = %s WHERE batch_no = %s",
+            (json.dumps(response), payload.batch_no),
+        )
+    return response
 
 
 # ---- 漂移重算 ------------------------------------------------------------------
